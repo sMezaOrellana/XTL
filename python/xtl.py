@@ -1,5 +1,6 @@
 from cffi import FFI
 import os
+import time as _time
 
 ffi = FFI()
 
@@ -12,6 +13,7 @@ ffi.cdef(_header)
 
 _lib_path = os.path.join(os.path.dirname(__file__), "libxtl.so")
 lib = ffi.dlopen(_lib_path)
+lib.tensor_srand(int(_time.time()) & 0xFFFFFFFF)
 
 
 def _make_shape(shape):
@@ -157,6 +159,27 @@ def zeros(shape):
 def rand(shape):
     c_shape = _make_shape(shape)
     return Tensor(lib.create_tensor_rand(c_shape, len(shape)))
+
+
+def cat(tensors, axis):
+    """Concatenate a list of Tensors along axis."""
+    ptrs = ffi.new("Tensor*[]", [t._ptr for t in tensors])
+    return Tensor(lib.tensor_cat(ptrs, len(tensors), axis))
+
+
+def causal_mask(T):
+    """Create a [T, T] causal attention mask."""
+    return Tensor(lib.tensor_causal_mask(T))
+
+
+def argmax(tensor):
+    """Return the flat index of the maximum element."""
+    return lib.tensor_argmax(tensor._ptr)
+
+
+def sample(probs):
+    """Sample an index from a 1-D probability tensor."""
+    return lib.tensor_sample(probs._ptr)
 
 
 def from_numpy(arr):

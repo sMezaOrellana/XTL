@@ -7,7 +7,7 @@ Weight layout note: GPT-2 uses Conv1D which stores weights as [in, out],
 so all linear projections are x @ w (not x @ w.T).
 """
 
-import numpy as np
+import numpy as np  # used only in _load_weights for weight preprocessing
 import tiktoken
 import xtl
 
@@ -88,28 +88,25 @@ class GPT2:
 
     def _attn(self, x, blk, mask):
         """Causal multi-head self-attention."""
-        T     = x.shape[0]
         D     = self.head_dim
         scale = D ** -0.5
 
-        head_nps = []
+        heads = []
         for h in range(self.n_head):
             q = x @ blk["qw"][h] + blk["qb"][h]  # [T, D]
             k = x @ blk["kw"][h] + blk["kb"][h]  # [T, D]
             v = x @ blk["vw"][h] + blk["vb"][h]  # [T, D]
 
-            # k^T: [T, D] -> contiguous copy then transpose -> [D, T]
             kt = k.contiguous()
-            kt.transpose()
+            kt.transpose()                        # [D, T]
 
             scores = (q @ kt).mul_scalar(scale)  # [T, T]
-            scores = scores + mask               # add -inf to future positions
-            scores = scores.softmax(1)           # row-wise softmax
+            scores = scores + mask
+            scores = scores.softmax(1)
 
-            head_nps.append(xtl.to_numpy(scores @ v))  # [T, D]
+            heads.append(scores @ v)              # [T, D]
 
-        # Merge heads: numpy concat then back to XTL
-        merged = xtl.from_numpy(np.concatenate(head_nps, axis=1))  # [T, C]
+        merged = xtl.cat(heads, axis=1)           # [T, C]
         return merged @ blk["c_proj_w"] + blk["c_proj_b"]
 
     def _ffn(self, x, blk):
@@ -122,11 +119,7 @@ class GPT2:
     def forward(self, token_ids: list[int]):
         T = len(token_ids)
 
-        # Causal mask: 0 where attending, -1e10 where blocked
-        mask_np = np.where(
-            np.tril(np.ones((T, T), dtype=np.float32)), 0.0, -1e10
-        ).astype(np.float32)
-        mask = xtl.from_numpy(mask_np)
+        mask = xtl.causal_mask(T)
 
         # Embeddings: token + position
         pos = list(range(T))
@@ -144,29 +137,53 @@ class GPT2:
     # ── generation ────────────────────────────────────────────────────────────
 
     def generate(self, prompt: str, max_new_tokens: int = 20,
-                 temperature: float = 1.0, print_prefix: str | None = None) -> str:
+                 temperature: float = 1.0, print_prefix: str | None = None,
+                 stop: list[str] | None = None) -> str:
         tokens = self._enc.encode(prompt)
+        prompt_len = len(tokens)
+
+        # How many chars to hold back so stop sequences don't get printed mid-match
+        lookback = max((len(s) for s in stop), default=0) if stop else 0
 
         if print_prefix is not None:
             print(print_prefix, end="", flush=True)
+
+        printed = 0  # chars of generated text already printed
 
         for _ in range(max_new_tokens):
             ctx = tokens[-self.n_ctx:]
             logits = self.forward(ctx)
 
-            last = xtl.to_numpy(logits)[-1]  # [50257]
+            T = len(ctx)
+            last = logits.gather([T - 1]).reshape([self.n_vocab])
             if temperature == 1.0:
-                next_tok = int(np.argmax(last))
+                next_tok = xtl.argmax(last)
             else:
-                last = last / temperature
-                last -= last.max()
-                probs = np.exp(last)
-                probs /= probs.sum()
-                next_tok = int(np.random.choice(len(probs), p=probs))
+                probs = last.div_scalar(temperature).softmax(0)
+                next_tok = xtl.sample(probs)
 
             tokens.append(next_tok)
+            generated = self._enc.decode(tokens[prompt_len:])
+
+            if stop:
+                hit = next((s for s in stop if s in generated), None)
+                if hit:
+                    clean = generated[:generated.index(hit)]
+                    if print_prefix is not None:
+                        print(clean[printed:], end="", flush=True)
+                    tokens = tokens[:prompt_len] + self._enc.encode(clean)
+                    break
+
+            # Stream everything except the last `lookback` chars
             if print_prefix is not None:
-                print(self._enc.decode([next_tok]), end="", flush=True)
+                safe = max(0, len(generated) - lookback)
+                print(generated[printed:safe], end="", flush=True)
+                printed = safe
+
+        else:
+            # Max tokens reached — flush the held-back buffer
+            if print_prefix is not None:
+                print(self._enc.decode(tokens[prompt_len:])[printed:], end="", flush=True)
 
         if print_prefix is not None:
             print()
@@ -203,5 +220,6 @@ if __name__ == "__main__":
         # Q:/A: format signals GPT-2 to answer rather than complete the question
         history += f"Q: {user}\nA:"
         t0 = time.time()
-        history = model.generate(history, max_new_tokens=40, print_prefix="GPT-2:")
+        history = model.generate(history, max_new_tokens=60, print_prefix="GPT-2:",
+                                 stop=["\nQ:", "\n\n"])
         print(f"  ({time.time()-t0:.1f}s)\n")
