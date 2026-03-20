@@ -93,15 +93,57 @@ static Tensor* tensor_matmul_impl(Tensor* a, Tensor* b) {
     int b_row_stride = b->strides[b->ndim - 2];
     int b_col_stride = b->strides[b->ndim - 1];
 
-    for (int i = 0; i < M; i++) {
-      for (int j = 0; j < N; j++) {
-        float sum = 0.0f;
+    /* If either slice is non-contiguous (e.g. after transpose), materialise a
+       contiguous copy so the tiled fast path can always be used. */
+    float* a_data = a_ptr;
+    float* b_data = b_ptr;
+    float* a_tmp  = NULL;
+    float* b_tmp  = NULL;
+
+    if (a_col_stride != 1 || a_row_stride != K) {
+      a_tmp = malloc(sizeof(float) * M * K);
+      if (!a_tmp) goto clean_up;
+      for (int i = 0; i < M; i++)
         for (int k = 0; k < K; k++)
-          sum += a_ptr[i * a_row_stride + k * a_col_stride]
-               * b_ptr[k * b_row_stride + j * b_col_stride];
-        c_ptr[i * N + j] = sum;
+          a_tmp[i * K + k] = a_ptr[i * a_row_stride + k * a_col_stride];
+      a_data = a_tmp;
+    }
+
+    if (b_col_stride != 1 || b_row_stride != N) {
+      b_tmp = malloc(sizeof(float) * K * N);
+      if (!b_tmp) { free(a_tmp); goto clean_up; }
+      for (int k = 0; k < K; k++)
+        for (int j = 0; j < N; j++)
+          b_tmp[k * N + j] = b_ptr[k * b_row_stride + j * b_col_stride];
+      b_data = b_tmp;
+    }
+
+    /* Tiled matmul: loop order i,k,j keeps B accesses sequential (row-major).
+       Tile size 32 fits three 32×32 tiles in L1 (~12 KB of 40 KB available).
+       -O3 -march=native auto-vectorises the inner j loop with AVX2 FMA. */
+    #define TILE 32
+    for (int i = 0; i < M * N; i++) c_ptr[i] = 0.0f;
+
+    for (int i0 = 0; i0 < M; i0 += TILE) {
+      int i1 = i0 + TILE < M ? i0 + TILE : M;
+      for (int k0 = 0; k0 < K; k0 += TILE) {
+        int k1 = k0 + TILE < K ? k0 + TILE : K;
+        for (int j0 = 0; j0 < N; j0 += TILE) {
+          int j1 = j0 + TILE < N ? j0 + TILE : N;
+          for (int i = i0; i < i1; i++) {
+            for (int k = k0; k < k1; k++) {
+              float a_val = a_data[i * K + k];
+              for (int j = j0; j < j1; j++)
+                c_ptr[i * N + j] += a_val * b_data[k * N + j];
+            }
+          }
+        }
       }
     }
+    #undef TILE
+
+    free(a_tmp);
+    free(b_tmp);
   }
 
 clean_up:
@@ -467,6 +509,108 @@ Tensor* tensor_layer_norm(Tensor* a, int axis) {
   free_tensor(std);
   return out;
 }
+
+/* Concatenate n tensors along axis. All must have the same shape except on axis. */
+Tensor* tensor_cat(Tensor** tensors, int n, int axis) {
+  if (n <= 0) return NULL;
+  int ndim = tensors[0]->ndim;
+
+  for (int i = 1; i < n; i++) {
+    if (tensors[i]->ndim != ndim) {
+      fprintf(stderr, "tensor_cat: ndim mismatch\n");
+      return NULL;
+    }
+    for (int d = 0; d < ndim; d++) {
+      if (d != axis && tensors[i]->shape[d] != tensors[0]->shape[d]) {
+        fprintf(stderr, "tensor_cat: shape mismatch at dim %d\n", d);
+        return NULL;
+      }
+    }
+  }
+
+  int* out_shape = malloc(sizeof(int) * ndim);
+  if (!out_shape) return NULL;
+  for (int d = 0; d < ndim; d++) out_shape[d] = tensors[0]->shape[d];
+  for (int i = 1; i < n; i++) out_shape[axis] += tensors[i]->shape[axis];
+
+  Tensor* out = init_tensor(out_shape, ndim);
+  free(out_shape);
+  if (!out) return NULL;
+
+  int* coords = malloc(sizeof(int) * ndim);
+  if (!coords) { free_tensor(out); return NULL; }
+
+  for (int i = 0; i < out->size; i++) {
+    int remaining = i;
+    for (int d = ndim - 1; d >= 0; d--) {
+      coords[d] = remaining % out->shape[d];
+      remaining /= out->shape[d];
+    }
+
+    // find which input tensor owns this axis coordinate
+    int axis_coord = coords[axis];
+    int t = 0;
+    while (t < n - 1 && axis_coord >= tensors[t]->shape[axis]) {
+      axis_coord -= tensors[t]->shape[axis];
+      t++;
+    }
+
+    int src_offset = 0;
+    for (int d = 0; d < ndim; d++) {
+      int c = (d == axis) ? axis_coord : coords[d];
+      src_offset += c * tensors[t]->strides[d];
+    }
+    out->data[i] = tensors[t]->data[src_offset];
+  }
+
+  free(coords);
+  return out;
+}
+
+/* Create a [T, T] causal mask: 0 where j <= i, -1e10 where j > i. */
+Tensor* tensor_causal_mask(int T) {
+  int shape[2] = {T, T};
+  Tensor* out = init_tensor(shape, 2);
+  if (!out) return NULL;
+  for (int i = 0; i < T; i++)
+    for (int j = 0; j < T; j++)
+      out->data[i * T + j] = (j <= i) ? 0.0f : -1e10f;
+  return out;
+}
+
+/* Return the flat index of the maximum element (handles non-contiguous). */
+int tensor_argmax(Tensor* a) {
+  int best = 0;
+  float best_val = -FLT_MAX;
+  for (int i = 0; i < a->size; i++) {
+    int offset = 0, rem = i;
+    for (int d = a->ndim - 1; d >= 0; d--) {
+      offset += (rem % a->shape[d]) * a->strides[d];
+      rem /= a->shape[d];
+    }
+    if (a->data[offset] > best_val) { best_val = a->data[offset]; best = i; }
+  }
+  return best;
+}
+
+/* Sample an index from a 1-D probability tensor using the current rand() state. */
+int tensor_sample(Tensor* probs) {
+  float r = (float)rand() / ((float)RAND_MAX + 1.0f);
+  float cumsum = 0.0f;
+  for (int i = 0; i < probs->size; i++) {
+    int offset = 0, rem = i;
+    for (int d = probs->ndim - 1; d >= 0; d--) {
+      offset += (rem % probs->shape[d]) * probs->strides[d];
+      rem /= probs->shape[d];
+    }
+    cumsum += probs->data[offset];
+    if (r < cumsum) return i;
+  }
+  return probs->size - 1;
+}
+
+/* Seed the C random number generator. */
+void tensor_srand(unsigned int seed) { srand(seed); }
 
 /* gather: integer index lookup along axis 0.
    indices[i] selects row i from a. out shape: [num_indices, a->shape[1], ...] */
