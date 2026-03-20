@@ -1,0 +1,12 @@
+[project]
+name = "python"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "cffi>=2.0.0",
+    "pytest>=9.0.2",
+    "numpy>=1.26",
+    "safetensors>=0.4",
+    "tiktoken>=0.7",
+]

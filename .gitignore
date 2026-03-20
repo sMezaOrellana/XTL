@@ -1,0 +1,22 @@
+# Build outputs
+main
+python/libxtl.so
+
+# Model weights (large binary files)
+python/model.safetensors
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+python/.venv/
+
+# uv
+python/uv.lock
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
