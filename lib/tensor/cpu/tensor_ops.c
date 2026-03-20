@@ -6,6 +6,10 @@
 #include <math.h>
 #include <float.h>
 
+/* Defined in matmul_kernel.c, compiled without -fopenmp for full AVX2 vectorisation. */
+void matmul_tiled_serial(float* restrict C, const float* restrict A,
+                         const float* restrict B, int M, int K, int N);
+
 bool tensor_check_op_dim(Tensor* a, Tensor* b) {
   Tensor* larger  = a->ndim >= b->ndim ? a : b;
   Tensor* shorter = a->ndim <  b->ndim ? a : b;
@@ -120,27 +124,41 @@ static Tensor* tensor_matmul_impl(Tensor* a, Tensor* b) {
 
     /* Tiled matmul: loop order i,k,j keeps B accesses sequential (row-major).
        Tile size 32 fits three 32×32 tiles in L1 (~12 KB of 40 KB available).
-       -O3 -march=native auto-vectorises the inner j loop with AVX2 FMA. */
-    #define TILE 32
-    for (int i = 0; i < M * N; i++) c_ptr[i] = 0.0f;
-
-    for (int i0 = 0; i0 < M; i0 += TILE) {
-      int i1 = i0 + TILE < M ? i0 + TILE : M;
-      for (int k0 = 0; k0 < K; k0 += TILE) {
-        int k1 = k0 + TILE < K ? k0 + TILE : K;
+       collapse(2) on (i0,j0) exposes M/TILE * N/TILE independent tasks so
+       OpenMP can fill all cores even when M=1 (single-token decode).
+       Threshold: skip OpenMP for tiny matrices where thread overhead > compute. */
+    if ((long)M * K * N > 25000000L && (M > 1 || N > 10000)) {
+      /* Parallel path: collapse(i0,j0) tiles across all cores.
+         omp simd on j ensures AVX2 vectorisation inside each thread. */
+      float* restrict ra = a_data;
+      float* restrict rb = b_data;
+      float* restrict rc = c_ptr;
+      #define TILE 32
+      for (int i = 0; i < M * N; i++) rc[i] = 0.0f;
+      #pragma omp parallel for collapse(2) schedule(static)
+      for (int i0 = 0; i0 < M; i0 += TILE) {
         for (int j0 = 0; j0 < N; j0 += TILE) {
+          int i1 = i0 + TILE < M ? i0 + TILE : M;
           int j1 = j0 + TILE < N ? j0 + TILE : N;
-          for (int i = i0; i < i1; i++) {
-            for (int k = k0; k < k1; k++) {
-              float a_val = a_data[i * K + k];
-              for (int j = j0; j < j1; j++)
-                c_ptr[i * N + j] += a_val * b_data[k * N + j];
+          for (int k0 = 0; k0 < K; k0 += TILE) {
+            int k1 = k0 + TILE < K ? k0 + TILE : K;
+            for (int i = i0; i < i1; i++) {
+              for (int k = k0; k < k1; k++) {
+                float a_val = ra[i * K + k];
+                #pragma omp simd
+                for (int j = j0; j < j1; j++)
+                  rc[i * N + j] += a_val * rb[k * N + j];
+              }
             }
           }
         }
       }
+      #undef TILE
+    } else {
+      /* Serial path: compiled in a separate TU without -fopenmp so gcc
+         can freely auto-vectorise with AVX2 FMA. */
+      matmul_tiled_serial(c_ptr, a_data, b_data, M, K, N);
     }
-    #undef TILE
 
     free(a_tmp);
     free(b_tmp);

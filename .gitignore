@@ -5,13 +5,18 @@ python/libxtl.so
 # Model weights (large binary files)
 python/model.safetensors
 
+build/
+*.so
+*.o
+*.svg
+
 # Python
 __pycache__/
 *.pyc
 *.pyo
 .venv/
 python/.venv/
-
+python/gpt2*
 # uv
 python/uv.lock
 
