@@ -9,4 +9,5 @@ dependencies = [
     "numpy>=1.26",
     "safetensors>=0.4",
     "tiktoken>=0.7",
+    "py-spy>=0.4.1",
 ]
