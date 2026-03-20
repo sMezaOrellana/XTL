@@ -87,6 +87,21 @@ Tensor* tensor_layer_norm(Tensor* a, int axis);
 /* Gather rows from a along axis 0 by integer indices. Returns a new tensor. */
 Tensor* tensor_gather(Tensor* a, int* indices, int num_indices);
 
+/* Concatenate n tensors along axis. All must share the same shape except on axis. */
+Tensor* tensor_cat(Tensor** tensors, int n, int axis);
+
+/* Create a [T, T] causal attention mask: 0 on/below diagonal, -1e10 above. */
+Tensor* tensor_causal_mask(int T);
+
+/* Return the flat index of the maximum element. */
+int tensor_argmax(Tensor* a);
+
+/* Sample an index from a 1-D probability tensor using rand(). */
+int tensor_sample(Tensor* probs);
+
+/* Seed the C random number generator. */
+void tensor_srand(unsigned int seed);
+
 /* Elementwise activations. Return a new tensor. */
 Tensor* tensor_gelu      (Tensor* a);
 Tensor* tensor_gelu_apprx(Tensor* a);

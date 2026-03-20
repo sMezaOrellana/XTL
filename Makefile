@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -lm
+CFLAGS = -Wall -Wextra -O3 -march=native -lm
 
 LIB_SRC = lib/tensor/cpu/tensor_alloc.c \
            lib/tensor/cpu/tensor_fill.c \
